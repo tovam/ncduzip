@@ -8,6 +8,7 @@ const sink = @import("sink.zig");
 const mem_sink = @import("mem_sink.zig");
 const bin_reader = @import("bin_reader.zig");
 const delete = @import("delete.zig");
+const archive = @import("archive.zig");
 const ui = @import("ui.zig");
 const c = @import("c.zig").c;
 const util = @import("util.zig");
@@ -17,6 +18,9 @@ pub var dir_parent: *model.Dir = undefined;
 pub var dir_path: [:0]u8 = undefined;
 var dir_parents: std.ArrayListUnmanaged(model.Ref) = .empty;
 var dir_alloc = std.heap.ArenaAllocator.init(main.allocator);
+// Stack depth of the ZIP root while browsing an archive. Nested archives are
+// deliberately not opened in the MVP.
+var archive_root_depth: ?usize = null;
 
 // Used to keep track of which dir is which ref, so we can enter it.
 // Only used for binreader browsing.
@@ -33,6 +37,14 @@ var dir_loading: u64 = 0;
 
 // Index into dir_items that is currently selected.
 var cursor_idx: usize = 0;
+
+fn inArchive() bool {
+    return archive_root_depth != null;
+}
+
+fn canOpenArchive(entry: *model.Entry) bool {
+    return !inArchive() and !main.config.binreader and !main.config.imported and archive.isCandidate(entry);
+}
 
 const View = struct {
     // Index into dir_items, indicates which entry is displayed at the top of the view.
@@ -182,6 +194,7 @@ pub fn loadDir(next_sel: u64) void {
 
 
 pub fn initRoot() void {
+    archive_root_depth = null;
     if (main.config.binreader) {
         const ref = bin_reader.getRoot();
         dir_parent = bin_reader.get(ref, main.allocator).dir() orelse ui.die("Invalid import\n", .{});
@@ -216,6 +229,8 @@ fn enterSub(e: *model.Dir) void {
 fn enterParent() void {
     std.debug.assert(dir_parents.items.len > 1);
 
+    const leaving_archive = if (archive_root_depth) |depth| dir_parents.items.len == depth else false;
+
     _ = dir_parents.pop();
     const p = dir_parents.items[dir_parents.items.len-1];
     if (main.config.binreader) {
@@ -227,6 +242,7 @@ fn enterParent() void {
     const newpath = main.allocator.dupeZ(u8, std.fs.path.dirname(dir_path) orelse unreachable) catch unreachable;
     main.allocator.free(dir_path);
     dir_path = newpath;
+    if (leaving_archive) archive_root_depth = null;
 }
 
 
@@ -264,7 +280,9 @@ const Row = struct {
             width += 2 + width;
         defer self.col += width;
         const item = self.item orelse return;
-        const siz = if (main.config.show_blocks) util.blocksToSize(item.pack.blocks) else item.size;
+        const siz = if (main.config.show_blocks)
+            (if (inArchive()) @as(u64, item.pack.blocks) else util.blocksToSize(item.pack.blocks))
+        else item.size;
         var shr = if (item.dir()) |d| (if (main.config.show_blocks) util.blocksToSize(d.shared_blocks) else d.shared_size) else 0;
         if (main.config.show_shared == .unique) shr = siz -| shr;
 
@@ -376,7 +394,7 @@ const Row = struct {
         ui.move(self.row, self.col);
         if (self.item) |i| {
             self.bg.fg(if (i.pack.etype == .dir) .dir else .default);
-            ui.addch(if (i.pack.etype.isDirectory()) '/' else ' ');
+            ui.addch(if (i.pack.etype.isDirectory()) '/' else if (canOpenArchive(i)) '>' else ' ');
             ui.addstr(ui.shorten(ui.toUtf8(i.name()), ui.cols -| self.col -| 1));
         } else {
             self.bg.fg(.dir);
@@ -572,9 +590,19 @@ const info = struct {
             }
         }
 
-        // Disk usage & Apparent size
-        drawSize(box, row, "   Disk usage: ", util.blocksToSize(e.pack.blocks), if (e.dir()) |d| util.blocksToSize(d.shared_blocks) else 0);
-        drawSize(box, row, "Apparent size: ", e.size, if (e.dir()) |d| d.shared_size else 0);
+        // Physical/apparent sizes for filesystem entries, packed/unpacked for
+        // virtual entries inside a ZIP.
+        if (inArchive()) {
+            drawSize(box, row, "   Packed size: ", e.pack.blocks, 0);
+            drawSize(box, row, " Unpacked size: ", e.size, 0);
+        } else {
+            drawSize(box, row, "    Disk usage: ", util.blocksToSize(e.pack.blocks), if (e.dir()) |d| util.blocksToSize(d.shared_blocks) else 0);
+            drawSize(box, row, " Apparent size: ", e.size, if (e.dir()) |d| d.shared_size else 0);
+            if (archive.loaded(e)) |root| {
+                drawSize(box, row, "ZIP packed size: ", root.entry.pack.blocks, 0);
+                drawSize(box, row, "ZIP unpacked:    ", root.entry.size, 0);
+            }
+        }
 
         // Number of items
         if (e.dir()) |d| {
@@ -612,6 +640,7 @@ const info = struct {
               4 // name + type + disk usage + apparent size
             + (if (e.ext() != null) @as(u32, 1) else 0) // last modified
             + (if (e.link() != null) @as(u32, 1) else 0) // link count
+            + (if (!inArchive() and archive.loaded(e) != null) @as(u32, 2) else 0) // ZIP totals
             + (if (e.dir()) |d| 1 // sub items
                     + (if (d.shared_size > 0) @as(u32, 2) else 0)
                     + (if (d.shared_blocks > 0) @as(u32, 2) else 0)
@@ -675,7 +704,7 @@ const help = struct {
     const keys = [_][:0]const u8{
               "up, k", "Move cursor up",
             "down, j", "Move cursor down",
-        "right/enter", "Open selected directory",
+        "right/enter", "Open selected directory or ZIP",
          "left, <, h", "Open parent directory",
                   "n", "Sort by name (ascending/descending)",
                   "s", "Sort by size (ascending/descending)",
@@ -685,7 +714,7 @@ const help = struct {
                   "t", "Toggle dirs before files when sorting",
                   "g", "Show percentage and/or graph",
                   "u", "Show/hide hard link shared sizes",
-                  "a", "Toggle between apparent size and disk usage",
+                  "a", "Toggle apparent/unpacked and disk/packed size",
                   "c", "Toggle display of child item counts",
                   "m", "Toggle display of latest mtime (-e flag)",
                   "e", "Show/hide hidden or excluded files",
@@ -873,6 +902,18 @@ pub fn draw() void {
     if (dir_loading > 0) {
         ui.addstr(" Loading... ");
         ui.addnum(.hd, dir_loading);
+    } else if (inArchive()) {
+        ui.addch(if (main.config.show_blocks) '*' else ' ');
+        ui.style(if (main.config.show_blocks) .bold_hd else .hd);
+        ui.addstr("Total packed: ");
+        ui.addsize(.hd, dir_parent.entry.pack.blocks);
+        ui.style(if (main.config.show_blocks) .hd else .bold_hd);
+        ui.addstr("  ");
+        ui.addch(if (main.config.show_blocks) ' ' else '*');
+        ui.addstr("Unpacked: ");
+        ui.addsize(.hd, dir_parent.entry.size);
+        ui.addstr("   Items: ");
+        ui.addnum(.hd, dir_parent.items);
     } else {
         ui.addch(if (main.config.show_blocks) '*' else ' ');
         ui.style(if (main.config.show_blocks) .bold_hd else .hd);
@@ -954,7 +995,9 @@ pub fn keyInput(ch: i32) void {
         '?' => state = .help,
         'i' => if (dir_items.items.len > 0) info.set(dir_items.items[cursor_idx], .info),
         'r' => {
-            if (main.config.binreader)
+            if (inArchive())
+                message = &.{"Refresh is not available inside ZIP archives."}
+            else if (main.config.binreader)
                 message = &.{"Refresh feature is not available when reading from file."}
             else if (!main.config.can_refresh.? and main.config.imported)
                 message = &.{"Refresh feature disabled.", "Re-run with --enable-refresh to enable this option."}
@@ -967,14 +1010,18 @@ pub fn keyInput(ch: i32) void {
             }
         },
         'b' => {
-            if (!main.config.can_shell.?)
+            if (inArchive())
+                message = &.{"Shell is not available inside ZIP archives."}
+            else if (!main.config.can_shell.?)
                 message = &.{"Shell feature disabled.", "Re-run with --enable-shell to enable this option."}
             else
                 main.state = .shell;
         },
         'd' => {
             if (dir_items.items.len == 0) {
-            } else if (main.config.binreader)
+            } else if (inArchive())
+                message = &.{"Cannot delete entries inside ZIP archives."}
+            else if (main.config.binreader)
                 message = &.{"File deletion is not available when reading from file."}
             else if (!main.config.can_delete.? and main.config.imported)
                 message = &.{"File deletion is disabled.", "Re-run with --enable-delete to enable this option."}
@@ -1023,6 +1070,17 @@ pub fn keyInput(ch: i32) void {
                 if (e.dir()) |d| {
                     enterSub(d);
                     //dir_parent = d;
+                    loadDir(0);
+                    state = .main;
+                } else if (canOpenArchive(e)) {
+                    const path = std.fs.path.joinZ(main.allocator, &.{ dir_path, e.name() }) catch unreachable;
+                    defer main.allocator.free(path);
+                    const dir = archive.open(e, dir_parent, path) catch |err| {
+                        message = &.{ "Unable to open ZIP archive.", archive.errorString(err) };
+                        return;
+                    };
+                    enterSub(dir);
+                    archive_root_depth = dir_parents.items.len;
                     loadDir(0);
                     state = .main;
                 }
