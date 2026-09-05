@@ -18,9 +18,11 @@ pub var dir_parent: *model.Dir = undefined;
 pub var dir_path: [:0]u8 = undefined;
 var dir_parents: std.ArrayListUnmanaged(model.Ref) = .empty;
 var dir_alloc = std.heap.ArenaAllocator.init(main.allocator);
-// Stack depth of the ZIP root while browsing an archive. Nested archives are
-// deliberately not opened in the MVP.
-var archive_root_depth: ?usize = null;
+const ArchiveFrame = struct {
+    context: *archive.Context,
+    root_depth: usize,
+};
+var archive_frames: std.ArrayListUnmanaged(ArchiveFrame) = .empty;
 
 // Used to keep track of which dir is which ref, so we can enter it.
 // Only used for binreader browsing.
@@ -39,11 +41,16 @@ var dir_loading: u64 = 0;
 var cursor_idx: usize = 0;
 
 fn inArchive() bool {
-    return archive_root_depth != null;
+    return archive_frames.items.len != 0;
+}
+
+fn currentArchive() ?*archive.Context {
+    if (archive_frames.items.len == 0) return null;
+    return archive_frames.items[archive_frames.items.len - 1].context;
 }
 
 fn canOpenArchive(entry: *model.Entry) bool {
-    return !inArchive() and !main.config.binreader and !main.config.imported and archive.isCandidate(entry);
+    return !main.config.binreader and !main.config.imported and archive.isCandidate(entry);
 }
 
 const View = struct {
@@ -194,7 +201,7 @@ pub fn loadDir(next_sel: u64) void {
 
 
 pub fn initRoot() void {
-    archive_root_depth = null;
+    archive_frames.clearRetainingCapacity();
     if (main.config.binreader) {
         const ref = bin_reader.getRoot();
         dir_parent = bin_reader.get(ref, main.allocator).dir() orelse ui.die("Invalid import\n", .{});
@@ -229,7 +236,8 @@ fn enterSub(e: *model.Dir) void {
 fn enterParent() void {
     std.debug.assert(dir_parents.items.len > 1);
 
-    const leaving_archive = if (archive_root_depth) |depth| dir_parents.items.len == depth else false;
+    const leaving_archive = inArchive() and
+        dir_parents.items.len == archive_frames.items[archive_frames.items.len - 1].root_depth;
 
     _ = dir_parents.pop();
     const p = dir_parents.items[dir_parents.items.len-1];
@@ -242,7 +250,7 @@ fn enterParent() void {
     const newpath = main.allocator.dupeZ(u8, std.fs.path.dirname(dir_path) orelse unreachable) catch unreachable;
     main.allocator.free(dir_path);
     dir_path = newpath;
-    if (leaving_archive) archive_root_depth = null;
+    if (leaving_archive) _ = archive_frames.pop();
 }
 
 
@@ -1073,14 +1081,21 @@ pub fn keyInput(ch: i32) void {
                     loadDir(0);
                     state = .main;
                 } else if (canOpenArchive(e)) {
-                    const path = std.fs.path.joinZ(main.allocator, &.{ dir_path, e.name() }) catch unreachable;
-                    defer main.allocator.free(path);
-                    const dir = archive.open(e, dir_parent, path) catch |err| {
+                    const opened = (if (currentArchive()) |context|
+                        archive.openNested(context, e, dir_parent)
+                    else blk: {
+                        const path = std.fs.path.joinZ(main.allocator, &.{ dir_path, e.name() }) catch unreachable;
+                        defer main.allocator.free(path);
+                        break :blk archive.openRoot(e, dir_parent, path);
+                    }) catch |err| {
                         message = &.{ "Unable to open ZIP archive.", archive.errorString(err) };
                         return;
                     };
-                    enterSub(dir);
-                    archive_root_depth = dir_parents.items.len;
+                    enterSub(opened.root);
+                    archive_frames.append(main.allocator, .{
+                        .context = opened.context,
+                        .root_depth = dir_parents.items.len,
+                    }) catch unreachable;
                     loadDir(0);
                     state = .main;
                 }

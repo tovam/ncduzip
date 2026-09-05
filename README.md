@@ -21,7 +21,13 @@ C version (1.x).
 
 ZIP files found during a normal filesystem scan are shown with a `>` marker.
 Press Enter to browse one like a directory. The archive is indexed lazily from
-its central directory; file contents are never decompressed or extracted.
+its central directory; regular file contents are never decompressed or
+extracted.
+
+ZIP files inside ZIP files can also be opened. Only the selected inner ZIP
+container is reconstructed in an anonymous temporary file; its contents are
+still indexed lazily. Nested archives are cached while their outer archive is
+cached.
 
 Inside an archive, disk usage represents packed size and apparent size
 represents unpacked size. Press `a` to switch between them. ZIP contents are a
@@ -31,7 +37,8 @@ This initial implementation intentionally keeps a narrow scope:
 
 - ZIP only, with ZIP64 support
 - at most 1,000,000 entries per archive
-- no nested archive browsing
+- nested ZIPs up to 3 levels deep and 2 GiB each (4 GiB cached total)
+- Store and Deflate compression for nested ZIP containers
 - no delete, refresh or shell commands inside archives
 - live filesystem scans only; imported ncdu reports remain unchanged
 
